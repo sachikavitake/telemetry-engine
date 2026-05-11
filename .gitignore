@@ -1,0 +1,6 @@
+*.db
+*.db.wal
+telemetry-engine
+worker/worker
+worker/query
+.DS_Store
