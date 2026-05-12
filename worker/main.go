@@ -24,6 +24,16 @@ type TelemetryEvent struct {
 	Timestamp  string  `json:"timestamp"`
 }
 
+// DLQMessage is what we store when a message fails processing 3 times.
+type DLQMessage struct {
+	OriginalData  string `json:"original_data"`
+	Error         string `json:"error"`
+	FailedAt      string `json:"failed_at"`
+	DeliveryCount int    `json:"delivery_count"`
+}
+
+const maxRetries = 3
+
 func main() {
 	db, err := sql.Open("duckdb", "telemetry.db")
 	if err != nil {
@@ -31,6 +41,7 @@ func main() {
 	}
 	defer db.Close()
 
+	// Create both tables
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS events (
 			service    VARCHAR,
@@ -41,9 +52,21 @@ func main() {
 		)
 	`)
 	if err != nil {
-		log.Fatal("Failed to create table: ", err)
+		log.Fatal("Failed to create events table: ", err)
 	}
-	log.Println("DuckDB ready — table 'events' exists")
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS dead_letters (
+			original_data    VARCHAR,
+			error            VARCHAR,
+			failed_at        TIMESTAMP,
+			delivery_count   INTEGER
+		)
+	`)
+	if err != nil {
+		log.Fatal("Failed to create dead_letters table: ", err)
+	}
+	log.Println("DuckDB ready — tables 'events' and 'dead_letters' exist")
 
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
@@ -59,21 +82,18 @@ func main() {
 
 	ctx := context.Background()
 	consumer, err := js.CreateOrUpdateConsumer(ctx, "TELEMETRY", jetstream.ConsumerConfig{
-		Name:    "duckdb-writer",
-		Durable: "duckdb-writer",
+		Name:       "duckdb-writer",
+		Durable:    "duckdb-writer",
+		MaxDeliver: maxRetries, // NATS will deliver each message at most 3 times
+		// After 3 Nak()s, NATS stops redelivering automatically.
+		// We intercept on the 3rd attempt to save to DLQ before that happens.
+		FilterSubject: "TELEMETRY.events", // Only consume events, not deadletter messages
 	})
 	if err != nil {
 		log.Fatal("Failed to create consumer: ", err)
 	}
-	log.Println("NATS consumer 'duckdb-writer' ready")
+	log.Println("NATS consumer 'duckdb-writer' ready (max retries: 3)")
 
-	// --- NEW: Start the query API in a goroutine ---
-	// A goroutine is like a lightweight thread. "go someFunction()" runs it
-	// in the background while the rest of main() continues.
-	// We need this because:
-	//   - The NATS fetch loop below runs forever
-	//   - The HTTP server also runs forever
-	//   - We need BOTH running at the same time
 	go startQueryAPI(db)
 
 	sigCh := make(chan os.Signal, 1)
@@ -96,8 +116,7 @@ func main() {
 		for msg := range batch.Messages() {
 			var event TelemetryEvent
 			if err := json.Unmarshal(msg.Data(), &event); err != nil {
-				log.Printf("Bad message, skipping: %v", err)
-				msg.Ack()
+				handleBadMessage(js, db, msg, err)
 				continue
 			}
 			events = append(events, event)
@@ -127,14 +146,72 @@ func main() {
 	}
 }
 
-// startQueryAPI runs an HTTP server on port 8091 with analytics endpoints.
-func startQueryAPI(db *sql.DB) {
-	// /query/stats — overall stats and percentiles, optionally filtered by service
-	http.HandleFunc("/query/stats", func(w http.ResponseWriter, r *http.Request) {
-		service := r.URL.Query().Get("service") // e.g., /query/stats?service=auth-service
-		window := r.URL.Query().Get("window")   // e.g., /query/stats?window=1h
+// handleBadMessage decides whether to retry or send to the dead letter queue.
+// On attempts 1-2: Nak() tells NATS to redeliver.
+// On attempt 3: save to DLQ and Ack() so NATS stops redelivering.
+func handleBadMessage(js jetstream.JetStream, db *sql.DB, msg jetstream.Msg, parseErr error) {
+	deliveryCount := getDeliveryCount(msg)
 
-		// Build the WHERE clause dynamically based on filters
+	if deliveryCount >= maxRetries {
+		// Final attempt — send to dead letter queue
+		log.Printf("Dead-lettering message after %d attempts: %v", deliveryCount, parseErr)
+		publishToDLQ(js, msg.Data(), parseErr.Error(), deliveryCount)
+		saveToDLQ(db, msg.Data(), parseErr.Error(), deliveryCount)
+		msg.Ack() // Tell NATS we're done with this message
+	} else {
+		// Retry — Nak tells NATS to redeliver this message
+		log.Printf("Bad message (attempt %d/%d), will retry: %v", deliveryCount, maxRetries, parseErr)
+		msg.Nak()
+	}
+}
+
+// getDeliveryCount reads the delivery count from NATS message metadata.
+// JetStream tracks how many times a message has been delivered via msg.Metadata().
+func getDeliveryCount(msg jetstream.Msg) int {
+	meta, err := msg.Metadata()
+	if err != nil {
+		return 1
+	}
+	// NumDelivered starts at 1 for the first delivery
+	return int(meta.NumDelivered)
+}
+
+// publishToDLQ sends the failed message to the TELEMETRY.deadletter subject.
+// This keeps a copy in NATS for potential reprocessing later.
+func publishToDLQ(js jetstream.JetStream, rawData []byte, errMsg string, deliveryCount int) {
+	dlq := DLQMessage{
+		OriginalData:  string(rawData),
+		Error:         errMsg,
+		FailedAt:      time.Now().UTC().Format(time.RFC3339),
+		DeliveryCount: deliveryCount,
+	}
+	data, err := json.Marshal(dlq)
+	if err != nil {
+		log.Printf("Failed to marshal DLQ message: %v", err)
+		return
+	}
+	_, err = js.Publish(context.Background(), "TELEMETRY.deadletter", data)
+	if err != nil {
+		log.Printf("Failed to publish to DLQ: %v", err)
+	}
+}
+
+// saveToDLQ writes the failed message to the dead_letters table in DuckDB.
+func saveToDLQ(db *sql.DB, rawData []byte, errMsg string, deliveryCount int) {
+	_, err := db.Exec(
+		`INSERT INTO dead_letters (original_data, error, failed_at, delivery_count) VALUES (?, ?, ?, ?)`,
+		string(rawData), errMsg, time.Now().UTC(), deliveryCount,
+	)
+	if err != nil {
+		log.Printf("Failed to save to DLQ table: %v", err)
+	}
+}
+
+func startQueryAPI(db *sql.DB) {
+	http.HandleFunc("/query/stats", func(w http.ResponseWriter, r *http.Request) {
+		service := r.URL.Query().Get("service")
+		window := r.URL.Query().Get("window")
+
 		query := `
 			SELECT
 				COUNT(*)                                    AS total_events,
@@ -154,7 +231,6 @@ func startQueryAPI(db *sql.DB) {
 			args = append(args, service)
 		}
 		if window != "" {
-			// Parse window like "1h", "30m", "24h"
 			duration, err := time.ParseDuration(window)
 			if err != nil {
 				http.Error(w, "invalid window format (use 1h, 30m, etc.)", http.StatusBadRequest)
@@ -189,7 +265,6 @@ func startQueryAPI(db *sql.DB) {
 		json.NewEncoder(w).Encode(result)
 	})
 
-	// /query/services — breakdown by service
 	http.HandleFunc("/query/services", func(w http.ResponseWriter, r *http.Request) {
 		rows, err := db.Query(`
 			SELECT
@@ -222,6 +297,36 @@ func startQueryAPI(db *sql.DB) {
 			var s ServiceStats
 			rows.Scan(&s.Service, &s.TotalEvents, &s.AvgLatency, &s.P95Latency, &s.ErrorRate)
 			results = append(results, s)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(results)
+	})
+
+	// /query/dlq — inspect dead-lettered messages
+	http.HandleFunc("/query/dlq", func(w http.ResponseWriter, r *http.Request) {
+		limit := r.URL.Query().Get("limit")
+		if limit == "" {
+			limit = "20"
+		}
+
+		rows, err := db.Query(`
+			SELECT original_data, error, failed_at, delivery_count
+			FROM dead_letters
+			ORDER BY failed_at DESC
+			LIMIT ?
+		`, limit)
+		if err != nil {
+			http.Error(w, "query failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		var results []DLQMessage
+		for rows.Next() {
+			var d DLQMessage
+			rows.Scan(&d.OriginalData, &d.Error, &d.FailedAt, &d.DeliveryCount)
+			results = append(results, d)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
