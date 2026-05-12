@@ -5,18 +5,20 @@ A high-performance telemetry ingestion pipeline built with Go, NATS JetStream, a
 ## Architecture
 
 ```
-┌──────────┐         ┌──────────────┐         ┌─────────────────────┐
-│  Clients │──POST──→│  API Server  │──pub──→  │    NATS JetStream   │
-│  (curl)  │         │  :8090       │         │    :4222            │
-└──────────┘         └──────────────┘         └────────┬────────────┘
-                                                       │ pull (batches)
-                                                       ▼
-                                              ┌─────────────────────┐
-                                              │  Worker             │
-                                              │  - Batch writer     │
-                                              │  - Query API :8091  │
-                                              │  - DuckDB storage   │
-                                              └─────────────────────┘
+┌──────────┐         ┌──────────────────┐         ┌─────────────────────┐
+│  Clients │──POST──→│  API Server      │──pub──→  │    NATS JetStream   │
+│          │         │  :8090           │         │    :4222            │
+│          │←─503────│  - backpressure  │←─lag────│                     │
+└──────────┘         └──────────────────┘         └────────┬────────────┘
+                                                           │ pull (batches)
+                                                           ▼
+                                                  ┌─────────────────────┐
+                                                  │  Worker             │
+                                                  │  - Batch writer     │
+                                                  │  - Dead letter queue│
+                                                  │  - Query API :8091  │
+                                                  │  - DuckDB storage   │
+                                                  └─────────────────────┘
 ```
 
 ## Components
@@ -32,11 +34,21 @@ A high-performance telemetry ingestion pipeline built with Go, NATS JetStream, a
 - Acknowledges messages only after successful write (at-least-once delivery)
 - Serves a query API on port 8091
 
+### Dead Letter Queue
+- Failed messages are retried before being routed to a dead letter queue
+- Preserves original data and error reason for debugging
+- Queryable via `GET /query/dlq`
+
+### Backpressure Handling
+- API monitors consumer lag and rejects new events with HTTP 503 when the worker falls behind
+- Automatically resumes when the queue drains
+
 ### Query API (part of Worker)
 - `GET /query/stats` — P50, P95, P99 latency, min, max, avg
 - `GET /query/stats?service=auth-service` — filter by service
 - `GET /query/stats?window=1h` — filter by time window
 - `GET /query/services` — per-service breakdown with error rates
+- `GET /query/dlq` — inspect dead-lettered messages
 
 ## Tech Stack
 

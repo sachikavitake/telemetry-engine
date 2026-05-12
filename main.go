@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync/atomic"
 	"time"
 
-	"github.com/nats-io/nats.go"       // NATS client
-	"github.com/nats-io/nats.go/jetstream" // JetStream API
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 type TelemetryEvent struct {
@@ -20,9 +21,13 @@ type TelemetryEvent struct {
 	Timestamp  string  `json:"timestamp"`
 }
 
-// We store the JetStream instance globally so our handler can use it.
-// In Go, variables declared outside functions are "package-level" (like module globals in Python).
 var js jetstream.JetStream
+
+// pendingMessages tracks how many unprocessed messages are in NATS.
+// atomic.Int64 allows safe read/write from multiple goroutines without a mutex.
+var pendingMessages atomic.Int64
+
+const backpressureThreshold = 5000
 
 func handleIngest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -41,18 +46,23 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 		event.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	}
 
-	// Convert the event back to JSON bytes to send to NATS.
-	// json.Marshal is the opposite of Decode — struct → JSON bytes.
+	// Backpressure check — reject if worker is too far behind
+	pending := pendingMessages.Load()
+	if pending > backpressureThreshold {
+		log.Printf("Backpressure active: %d pending messages", pending)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusServiceUnavailable) // 503
+		fmt.Fprintf(w, `{"error": "backpressure active", "pending": %d}`, pending)
+		return
+	}
+
 	data, err := json.Marshal(event)
 	if err != nil {
 		http.Error(w, "failed to marshal event", http.StatusInternalServerError)
 		return
 	}
 
-	// Publish the event to the "TELEMETRY.events" subject.
-	// Think of a "subject" as a topic/channel name.
-	// The "r.Context()" passes the request's context — if the request is cancelled,
-	// the publish will be cancelled too.
 	_, err = js.Publish(r.Context(), "TELEMETRY.events", data)
 	if err != nil {
 		log.Printf("Failed to publish to NATS: %v", err)
@@ -68,32 +78,62 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status": "accepted"}`)
 }
 
+// monitorLag runs in a background goroutine. Every 3 seconds, it asks NATS
+// how many messages the consumer hasn't processed yet and updates the
+// shared pendingMessages counter.
+func monitorLag(js jetstream.JetStream, stream, consumerName string) {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		consumer, err := js.Consumer(context.Background(), stream, consumerName)
+		if err != nil {
+			// Consumer doesn't exist yet — worker hasn't started.
+			// Check stream directly to see if messages are piling up.
+			streamInfo, sErr := js.Stream(context.Background(), stream)
+			if sErr == nil {
+				info, iErr := streamInfo.Info(context.Background())
+				if iErr == nil && info.State.Msgs > 0 {
+					pendingMessages.Store(int64(info.State.Msgs))
+					log.Printf("Lag monitor: consumer not ready, %d messages in stream", info.State.Msgs)
+				}
+			}
+			continue
+		}
+
+		info, err := consumer.Info(context.Background())
+		if err != nil {
+			log.Printf("Lag monitor: failed to get info: %v", err)
+			continue
+		}
+
+		// NumPending = messages in the stream that this consumer hasn't processed
+		pending := int64(info.NumPending)
+		pendingMessages.Store(pending)
+
+		if pending > 0 {
+			log.Printf("Lag monitor: %d pending messages", pending)
+		}
+	}
+}
+
 func main() {
-	// --- Step 1: Connect to NATS ---
-	// nats.DefaultURL is "nats://localhost:4222" (the port we exposed from Docker)
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
 		log.Fatal("Failed to connect to NATS: ", err)
 	}
-	defer nc.Close() // "defer" = run this when main() exits. Like Python's "with" or "finally".
+	defer nc.Close()
 
 	log.Println("Connected to NATS")
 
-	// --- Step 2: Create a JetStream instance ---
 	js, err = jetstream.New(nc)
 	if err != nil {
 		log.Fatal("Failed to create JetStream: ", err)
 	}
 
-	// --- Step 3: Create a "Stream" ---
-	// A Stream is where JetStream stores messages on disk.
-	// We tell it: "Capture any message published to subjects matching TELEMETRY.>"
-	// The ">" is a wildcard — it matches TELEMETRY.events, TELEMETRY.errors, etc.
-	// context.Background() is a "no deadline, no cancellation" context.
-	// Used during setup because there's no HTTP request context here.
 	_, err = js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
-		Name:     "TELEMETRY",          // Name of the stream
-		Subjects: []string{"TELEMETRY.>"}, // Which subjects to capture
+		Name:     "TELEMETRY",
+		Subjects: []string{"TELEMETRY.>"},
 	})
 	if err != nil {
 		log.Fatal("Failed to create stream: ", err)
@@ -101,7 +141,10 @@ func main() {
 
 	log.Println("JetStream stream 'TELEMETRY' ready")
 
-	// --- Step 4: Start HTTP server ---
+	// Start background lag monitor
+	go monitorLag(js, "TELEMETRY", "duckdb-writer")
+	log.Printf("Backpressure enabled (threshold: %d pending messages)", backpressureThreshold)
+
 	http.HandleFunc("/ingest", handleIngest)
 
 	port := ":8090"
