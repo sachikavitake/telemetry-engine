@@ -5,12 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"golang.org/x/time/rate"
 )
 
 type TelemetryEvent struct {
@@ -29,9 +33,90 @@ var pendingMessages atomic.Int64
 
 const backpressureThreshold = 5000
 
+// Per-IP rate limiting
+const (
+	rateLimit       = 100 // requests per second per IP
+	cleanupInterval = 10 * time.Minute
+)
+
+type ipLimiter struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+var (
+	limiters sync.Map // map[string]*ipLimiter
+)
+
+// getClientIP extracts the client IP, checking proxy headers first.
+func getClientIP(r *http.Request) string {
+	// Check X-Forwarded-For (may contain multiple IPs: client, proxy1, proxy2)
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// First IP is the original client
+		if ip := strings.TrimSpace(strings.Split(xff, ",")[0]); ip != "" {
+			return ip
+		}
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	// Fall back to RemoteAddr, stripping the port
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// getLimiter returns the rate limiter for a given IP, creating one if needed.
+func getLimiter(ip string) *rate.Limiter {
+	now := time.Now()
+	if v, ok := limiters.Load(ip); ok {
+		entry := v.(*ipLimiter)
+		entry.lastSeen = now
+		return entry.limiter
+	}
+	limiter := rate.NewLimiter(rate.Limit(rateLimit), rateLimit)
+	limiters.Store(ip, &ipLimiter{limiter: limiter, lastSeen: now})
+	return limiter
+}
+
+// cleanupLimiters removes stale IP entries that haven't been seen recently.
+func cleanupLimiters() {
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		cutoff := time.Now().Add(-cleanupInterval)
+		var removed int
+		limiters.Range(func(key, value any) bool {
+			entry := value.(*ipLimiter)
+			if entry.lastSeen.Before(cutoff) {
+				limiters.Delete(key)
+				removed++
+			}
+			return true
+		})
+		if removed > 0 {
+			log.Printf("Rate limiter cleanup: removed %d stale entries", removed)
+		}
+	}
+}
+
 func handleIngest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Rate limit check — per-IP, checked before backpressure
+	clientIP := getClientIP(r)
+	if !getLimiter(clientIP).Allow() {
+		log.Printf("Rate limited: %s", clientIP)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests) // 429
+		fmt.Fprintf(w, `{"error": "rate limit exceeded", "limit": "%d req/s"}`, rateLimit)
 		return
 	}
 
@@ -144,6 +229,10 @@ func main() {
 	// Start background lag monitor
 	go monitorLag(js, "TELEMETRY", "duckdb-writer")
 	log.Printf("Backpressure enabled (threshold: %d pending messages)", backpressureThreshold)
+
+	// Start rate limiter cleanup
+	go cleanupLimiters()
+	log.Printf("Per-IP rate limiting enabled (%d req/s, cleanup every %v)", rateLimit, cleanupInterval)
 
 	http.HandleFunc("/ingest", handleIngest)
 

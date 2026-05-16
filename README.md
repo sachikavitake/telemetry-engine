@@ -8,6 +8,7 @@ A high-performance telemetry ingestion pipeline built with Go, NATS JetStream, a
 ┌──────────┐         ┌──────────────────┐         ┌─────────────────────┐
 │  Clients │──POST──→│  API Server      │──pub──→  │    NATS JetStream   │
 │          │         │  :8090           │         │    :4222            │
+│          │←─429────│  - rate limiting  │         │                     │
 │          │←─503────│  - backpressure  │←─lag────│                     │
 └──────────┘         └──────────────────┘         └────────┬────────────┘
                                                            │ pull (batches)
@@ -21,10 +22,18 @@ A high-performance telemetry ingestion pipeline built with Go, NATS JetStream, a
                                                   └─────────────────────┘
 ```
 
+### Request Flow
+
+```
+Request → Rate Limit (429) → Backpressure (503) → Publish to NATS (202)
+```
+
 ## Components
 
 ### API Server (`main.go`)
 - Receives telemetry events via `POST /ingest`
+- Per-IP rate limiting with token bucket algorithm
+- Backpressure detection via consumer lag monitoring
 - Publishes events to NATS JetStream for durable buffering
 - Decoupled from storage — stays fast even if the database is slow
 
@@ -34,14 +43,22 @@ A high-performance telemetry ingestion pipeline built with Go, NATS JetStream, a
 - Acknowledges messages only after successful write (at-least-once delivery)
 - Serves a query API on port 8091
 
-### Dead Letter Queue
-- Failed messages are retried before being routed to a dead letter queue
-- Preserves original data and error reason for debugging
-- Queryable via `GET /query/dlq`
+### Rate Limiting
+- Per-IP token bucket rate limiter (100 req/s per client IP)
+- Proxy-aware IP extraction (`X-Forwarded-For` → `X-Real-IP` → `RemoteAddr`)
+- Returns `429 Too Many Requests` with `Retry-After: 1` header when exceeded
+- Automatic cleanup of stale entries every 10 minutes
 
 ### Backpressure Handling
 - API monitors consumer lag and rejects new events with HTTP 503 when the worker falls behind
+- Returns `Retry-After: 5` header so clients know when to retry
 - Automatically resumes when the queue drains
+
+### Dead Letter Queue
+- Failed messages are retried up to 3 times before being routed to a dead letter queue
+- Preserves original data and error reason for debugging
+- Stored in both NATS (`TELEMETRY.deadletter`) and DuckDB (`dead_letters` table)
+- Queryable via `GET /query/dlq`
 
 ### Query API (part of Worker)
 - `GET /query/stats` — P50, P95, P99 latency, min, max, avg
@@ -57,6 +74,7 @@ A high-performance telemetry ingestion pipeline built with Go, NATS JetStream, a
 | Ingestion API | Go `net/http` | No framework needed, production-grade stdlib |
 | Message Buffer | NATS JetStream | Durable streaming with low overhead (~30MB RAM) |
 | Storage | DuckDB | Columnar OLAP — sub-second P95/P99 queries |
+| Rate Limiting | `golang.org/x/time/rate` | Token bucket algorithm, concurrent-safe |
 
 ## Event Schema
 
@@ -69,6 +87,15 @@ A high-performance telemetry ingestion pipeline built with Go, NATS JetStream, a
   "timestamp": "2026-05-11T12:00:00Z"
 }
 ```
+
+## Error Responses
+
+| Status | Meaning | When |
+|--------|---------|------|
+| `429 Too Many Requests` | Rate limit exceeded | Client IP exceeds 100 req/s |
+| `503 Service Unavailable` | Backpressure active | Worker is behind by 5000+ messages |
+| `400 Bad Request` | Invalid JSON | Malformed request body |
+| `405 Method Not Allowed` | Wrong HTTP method | Anything other than POST |
 
 ## Sample Query Response
 
