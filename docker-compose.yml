@@ -1,0 +1,39 @@
+services:
+  nats:
+    image: nats:latest
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/bin/api"]
+    ports:
+      - "8090:8090"
+    environment:
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      - nats
+    restart: on-failure
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/bin/worker"]
+    ports:
+      - "8091:8091"
+    environment:
+      - NATS_URL=nats://nats:4222
+      - DB_PATH=/data/telemetry.db
+    volumes:
+      - telemetry-data:/data
+    depends_on:
+      - nats
+    restart: on-failure
+
+volumes:
+  telemetry-data:

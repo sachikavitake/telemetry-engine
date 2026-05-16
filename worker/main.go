@@ -35,7 +35,12 @@ type DLQMessage struct {
 const maxRetries = 3
 
 func main() {
-	db, err := sql.Open("duckdb", "telemetry.db")
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "telemetry.db"
+	}
+
+	db, err := sql.Open("duckdb", dbPath)
 	if err != nil {
 		log.Fatal("Failed to open DuckDB: ", err)
 	}
@@ -68,7 +73,12 @@ func main() {
 	}
 	log.Println("DuckDB ready — tables 'events' and 'dead_letters' exist")
 
-	nc, err := nats.Connect(nats.DefaultURL)
+	natsURL := os.Getenv("NATS_URL")
+	if natsURL == "" {
+		natsURL = nats.DefaultURL
+	}
+
+	nc, err := nats.Connect(natsURL)
 	if err != nil {
 		log.Fatal("Failed to connect to NATS: ", err)
 	}

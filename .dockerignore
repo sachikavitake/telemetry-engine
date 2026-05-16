@@ -1,0 +1,5 @@
+.git
+telemetry.db
+docs
+test
+*.md

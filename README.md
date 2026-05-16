@@ -120,11 +120,31 @@ GET /query/services
 ]
 ```
 
-## Running Locally
+## Running with Docker Compose
+
+### Prerequisites
+- Docker
+
+### Start Everything
+```bash
+docker compose up --build
+```
+
+This starts NATS, the API server, and the worker. Data persists across restarts.
+
+```bash
+# Stop (keep data)
+docker compose down
+
+# Stop and wipe data
+docker compose down -v
+```
+
+## Running Locally (without Docker)
 
 ### Prerequisites
 - Go 1.21+
-- Docker
+- Docker (for NATS)
 
 ### Start NATS
 ```bash
@@ -140,6 +160,8 @@ go run main.go
 ```bash
 cd worker && go run main.go
 ```
+
+## Usage
 
 ### Send Events
 ```bash
